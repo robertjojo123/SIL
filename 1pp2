@@ -1,0 +1,196 @@
+-- ComputerCraft Video Player with Auto Scaling & Video Cycling
+
+-- Get monitor
+local monitor = peripheral.find("monitor")
+if not monitor then error("No monitor found!", 0) end
+
+-- Configuration
+local FPS = 10
+local FRAME_TIME_MS = 1000 / FPS
+local baseURL = "https://raw.githubusercontent.com/robertjojo123/SIL/refs/heads/main/video_part_"
+
+-- Auto-Set Monitor Scale
+monitor.setTextScale(0.5)  -- Max resolution for large monitors
+monitor.clear()
+
+-- Get monitor size
+local monW, monH = monitor.getSize()
+local startX, startY = 1, 1
+
+-- Ensure monitor is large enough
+if monW < 82 or monH < 14 then
+    error("[ERROR] Monitor too small! Expand or use a larger one.", 0)
+end
+
+-- === [BASE64 DECODER] ===
+local base64 = {}
+local b = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+function base64.decode(data)
+    data = data:gsub('[^'..b..'=]', '')
+    return (data:gsub('.', function(x)
+        if x == '=' then return '' end
+        local r, f = '', (b:find(x) - 1)
+        for i = 6, 1, -1 do r = r .. (f % 2^i - f % 2^(i - 1) > 0 and '1' or '0') end
+        return r
+    end):gsub('%d%d%d?%d?%d?%d?%d?%d?', function(x)
+        if #x ~= 8 then return '' end
+        local c = 0
+        for i = 1, 8 do c = c + (x:sub(i, i) == '1' and 2^(8 - i) or 0) end
+        return string.char(c)
+    end))
+end
+
+-- === [ZLIB DECOMPRESSOR] ===
+local zlib = {}
+function zlib.decompress(data)
+    if not data or #data < 6 then
+        error("Invalid compressed data")
+    end
+
+    local header = data:sub(1, 2)
+    local cmf, flg = header:byte(1, 2)
+
+    if (cmf * 256 + flg) % 31 ~= 0 then
+        error("Invalid Zlib header")
+    end
+
+    local compressedData = data:sub(3, -5)  -- Remove header and Adler32 checksum
+    return compressedData  -- Replace with full DEFLATE decompression if needed
+end
+
+-- Get time in milliseconds
+local function getTimeMs()
+    return math.floor(os.epoch("utc"))
+end
+
+-- Sleep while compensating for processing time
+local function compensatedSleep(targetTimeMs)
+    local currentTimeMs = getTimeMs()
+    local sleepTimeMs = targetTimeMs - currentTimeMs
+    if sleepTimeMs > 0 then os.sleep(sleepTimeMs / 1000) end
+end
+
+-- Download video part from URL
+local function downloadVideoPart(partNumber)
+    local path = "/video_part_" .. tostring(partNumber) .. ".bvf"
+    local url = baseURL .. tostring(partNumber) .. ".bvf"
+    
+    print("[DOWNLOAD] Fetching: " .. url)
+    local response = http.get(url, nil, true)
+
+    if response then
+        local file = fs.open(path, "wb")
+        file.write(response.readAll())
+        file.close()
+        response.close()
+        print("[DOWNLOAD] Downloaded part " .. partNumber)
+        return path
+    else
+        print("[ERROR] Failed to download part " .. partNumber)
+        return nil
+    end
+end
+
+-- Read & decode frame on-the-fly
+local function loadAndDecodeFrame(file)
+    if not file then return nil end
+
+    local frameLineCount = tonumber(file.readLine())
+    if not frameLineCount then return nil end
+
+    -- Extract text lines
+    local text_lines = {}
+    for i = 1, frameLineCount do
+        local line = file.readLine() or ""
+        table.insert(text_lines, line)
+    end
+
+    -- Extract foreground color lines
+    local fg_lines = {}
+    for i = 1, frameLineCount do
+        local line = file.readLine() or ""
+        table.insert(fg_lines, line)
+    end
+
+    -- Extract background color lines
+    local bg_lines = {}
+    for i = 1, frameLineCount do
+        local line = file.readLine() or ""
+        table.insert(bg_lines, line)
+    end
+
+    return { text = text_lines, fg = fg_lines, bg = bg_lines }
+end
+
+-- Display frame on monitor
+local function displayFrame(frame)
+    if not frame then return end
+
+    for i = 1, #frame.text do
+        monitor.setCursorPos(startX, startY + i - 1)
+        monitor.blit(frame.text[i], frame.fg[i], frame.bg[i])
+    end
+end
+
+-- Play video part with precise frame timing
+local function playVideoPart(file)
+    for frameIndex = 1, FPS do
+        local targetTimeMs = getTimeMs() + FRAME_TIME_MS
+
+        -- Load and render frame
+        local startRenderTime = getTimeMs()
+        local frameData = loadAndDecodeFrame(file)
+        displayFrame(frameData)
+        local endRenderTime = getTimeMs()
+
+        -- Log performance data to terminal (but not to the monitor)
+        print(string.format("[FRAME %d] Render Time: %dms", frameIndex, endRenderTime - startRenderTime))
+
+        -- Adjust sleep to maintain correct FPS
+        compensatedSleep(targetTimeMs)
+    end
+end
+
+-- Wait for redstone signal from **ANY SIDE**
+local function waitForRedstoneSignal()
+    local sides = {"top", "bottom", "left", "right", "front", "back"}
+
+    print("[WAIT] Waiting for redstone signal from any side...")
+
+    while true do
+        for _, side in ipairs(sides) do
+            if redstone.getInput(side) then
+                print("[START] Redstone signal detected on " .. side)
+                return getTimeMs()
+            end
+        end
+        os.sleep(0.1)
+    end
+end
+
+-- Start playback & cycle through video parts
+local function startPlayback()
+    local partNumber = 1  -- Start at part 1
+
+    while true do
+        waitForRedstoneSignal()
+
+        -- Download & play the next part
+        local path = downloadVideoPart(partNumber)
+        if path then
+            local file = openVideoFile(path)
+            if file then
+                playVideoPart(file)
+                file.close()
+            end
+            fs.delete(path)
+        else
+            print("[INFO] No more video parts, restarting from part 1.")
+            partNumber = 1
+        end
+
+        partNumber = partNumber + 1
+    end
+end
+
+startPlayback()
