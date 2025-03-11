@@ -1,0 +1,198 @@
+-- ComputerCraft Video Player with Proper Frame Decoding & Monitor Rendering
+
+-- Get monitor
+local monitor = peripheral.find("monitor")
+if not monitor then error("No monitor found!", 0) end
+
+-- Configuration
+local FPS = 10
+local FRAME_TIME_MS = 1000 / FPS
+local baseURL = "https://raw.githubusercontent.com/robertjojo123/SIL/refs/heads/main/video_part_"
+
+-- Auto-Set Monitor Scale
+monitor.setTextScale(0.5)  -- Max resolution for large monitors
+monitor.clear()
+
+-- Get monitor size
+local monW, monH = monitor.getSize()
+local startX, startY = 1, 1
+
+-- Ensure monitor is large enough
+if monW < 82 or monH < 26 then
+    error("[ERROR] Monitor too small! Expand or use a larger one.", 0)
+end
+
+-- === [Forward Declare Functions] ===
+local getTimeMs, compensatedSleep, downloadVideoPart, openVideoFile, 
+      loadAndDecodeFrame, displayFrame, playVideoPart, waitForRedstoneSignal, startPlayback
+
+-- === [BASE64 DECODER] ===
+local base64 = {}
+local b = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+function base64.decode(data)
+    data = data:gsub('[^'..b..'=]', '')
+    return (data:gsub('.', function(x)
+        if x == '=' then return '' end
+        local r, f = '', (b:find(x) - 1)
+        for i = 6, 1, -1 do r = r .. (f % 2^i - f % 2^(i - 1) > 0 and '1' or '0') end
+        return r
+    end):gsub('%d%d%d?%d?%d?%d?%d?%d?', function(x)
+        if #x ~= 8 then return '' end
+        local c = 0
+        for i = 1, 8 do c = c + (x:sub(i, i) == '1' and 2^(8 - i) or 0) end
+        return string.char(c)
+    end))
+end
+
+-- === [ZLIB DECOMPRESSOR] ===
+local zlib = {}
+function zlib.decompress(data)
+    if not data or #data < 6 then
+        error("Invalid compressed data")
+    end
+
+    local header = data:sub(1, 2)
+    local cmf, flg = header:byte(1, 2)
+
+    if (cmf * 256 + flg) % 31 ~= 0 then
+        error("Invalid Zlib header")
+    end
+
+    local compressedData = data:sub(3, -5)  -- Remove header and Adler32 checksum
+    return compressedData  -- Replace with full DEFLATE decompression if needed
+end
+
+-- === [Function Implementations] ===
+
+-- Get time in milliseconds
+getTimeMs = function()
+    return math.floor(os.epoch("utc"))
+end
+
+-- Sleep while compensating for processing time
+compensatedSleep = function(targetTimeMs)
+    local currentTimeMs = getTimeMs()
+    local sleepTimeMs = targetTimeMs - currentTimeMs
+    if sleepTimeMs > 0 then os.sleep(sleepTimeMs / 1000) end
+end
+
+-- Open video file safely
+openVideoFile = function(path)
+    if not fs.exists(path) then 
+        print("[ERROR] Video file missing: " .. path)
+        return nil 
+    end
+    local file = fs.open(path, "r")
+    
+    if not file then
+        print("[ERROR] Failed to open video file: " .. path)
+        return nil
+    end
+
+    -- Skip metadata lines
+    for _ = 1, 3 do 
+        local skip = file.readLine()
+        if not skip then
+            print("[ERROR] Corrupt or incomplete file header!")
+            file.close()
+            return nil
+        end
+    end
+
+    return file
+end
+
+-- Read & decode frame on-the-fly
+loadAndDecodeFrame = function(file)
+    if not file then 
+        print("[ERROR] File handle is nil!")
+        return nil 
+    end
+
+    -- Read frame line count safely
+    local frameLineCountStr = file.readLine()
+    if not frameLineCountStr then 
+        print("[ERROR] Failed to read frame line count!")
+        return nil 
+    end
+
+    local frameLineCount = tonumber(frameLineCountStr)
+    if not frameLineCount then 
+        print("[ERROR] Frame line count is invalid: " .. frameLineCountStr)
+        return nil 
+    end
+
+    -- Extract text lines
+    local text_lines = {}
+    for i = 1, frameLineCount do
+        local line = file.readLine()
+        if not line then return nil end
+        table.insert(text_lines, line)
+    end
+
+    -- Extract foreground color lines
+    local fg_lines = {}
+    for i = 1, frameLineCount do
+        local line = file.readLine()
+        if not line then return nil end
+        table.insert(fg_lines, line)
+    end
+
+    -- Extract background color lines
+    local bg_lines = {}
+    for i = 1, frameLineCount do
+        local line = file.readLine()
+        if not line then return nil end
+        table.insert(bg_lines, line)
+    end
+
+    return { text = text_lines, fg = fg_lines, bg = bg_lines }
+end
+
+-- Display frame on monitor
+displayFrame = function(frame)
+    if not frame then return end
+    monitor.setCursorPos(startX, startY)
+    monitor.clear()
+
+    for i = 1, #frame.text do
+        monitor.setCursorPos(startX, startY + i - 1)
+        monitor.blit(frame.text[i], frame.fg[i], frame.bg[i])
+    end
+end
+
+-- Play video part with precise frame timing
+playVideoPart = function(file)
+    for frameIndex = 1, FPS do
+        local targetTimeMs = getTimeMs() + FRAME_TIME_MS
+
+        -- Load and render frame
+        local startRenderTime = getTimeMs()
+        local frameData = loadAndDecodeFrame(file)
+        displayFrame(frameData)
+        local endRenderTime = getTimeMs()
+
+        -- Log frame rendering
+        print(string.format("[FRAME %d] Render Time: %dms", frameIndex, endRenderTime - startRenderTime))
+
+        -- Adjust sleep to maintain correct FPS
+        compensatedSleep(targetTimeMs)
+    end
+end
+
+-- Start playback & cycle through video parts
+startPlayback = function()
+    local path = "/mnt/data/video_part_1.bvf"
+
+    local file = openVideoFile(path)
+    if file then
+        print("[INFO] Playing video...")
+        playVideoPart(file)
+        file.close()
+    else
+        print("[ERROR] Failed to open video file.")
+    end
+end
+
+-- Start the video player
+startPlayback()
